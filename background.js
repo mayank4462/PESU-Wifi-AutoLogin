@@ -80,12 +80,12 @@ async function checkSession(forceLogin = false) {
 
   if (!state.pes_username || !state.pes_password) return;
 
-  if (state.isLoggingIn) {
-    const elapsed = Date.now() - (state.loginStartedAt || 0);
-    if (elapsed < LOGIN_LOCK_MS) return;
-    await setStorage({ isLoggingIn: false, loginStartedAt: 0 });
-  }
-
+  // Fast path FIRST, before the lock check: if the portal page is
+  // actually open and visible, always try it immediately. It reads
+  // the real DOM and checks loggedIn itself, so it's safe to run even
+  // if a slower hidden-tab attempt elsewhere is holding the lock —
+  // that lock should only block spawning a SECOND hidden tab, it
+  // should never block you from acting on a tab you're staring at.
   const portalTabs = await chrome.tabs.query({ url: PORTAL_MATCH });
   if (portalTabs.length > 0) {
     const tab = portalTabs[0];
@@ -123,6 +123,15 @@ async function checkSession(forceLogin = false) {
       }
     } catch (e) {
     }
+  }
+
+  // Slow path below: no visible portal tab, so we'd need to open a
+  // hidden one. The lock belongs here, not above — it only needs to
+  // stop two hidden-tab attempts from overlapping.
+  if (state.isLoggingIn) {
+    const elapsed = Date.now() - (state.loginStartedAt || 0);
+    if (elapsed < LOGIN_LOCK_MS) return;
+    await setStorage({ isLoggingIn: false, loginStartedAt: 0 });
   }
 
   // Not on PES Wi-Fi at all -> do nothing. No hidden tab, no lock held.
@@ -298,7 +307,7 @@ async function waitForTabComplete(tabId, timeoutMs = 5000) {
   });
 }
 
-async function waitForLoginSuccess(tabId, timeoutMs = 5000) {
+async function waitForLoginSuccess(tabId, timeoutMs = 5000, graceMs = 2500) {
   const start = Date.now();
 
   while (Date.now() - start < timeoutMs) {
@@ -314,6 +323,13 @@ async function waitForLoginSuccess(tabId, timeoutMs = 5000) {
 
       const result = results[0]?.result;
       if (result?.loggedIn || result?.loginFormVisible === false) {
+        // The page saying "signed in" is just its own session updating —
+        // the actual network-level authorization (the part that gives
+        // you real internet) can be a trailing step after that (another
+        // redirect / confirmation ping). Give it a moment to finish
+        // before we move on and, for a hidden tab, close it out from
+        // under that in-progress step.
+        await sleep(graceMs);
         return;
       }
     } catch (e) {
